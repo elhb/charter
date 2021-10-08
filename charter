@@ -1,0 +1,195 @@
+#! /usr/bin/env python
+
+import sys, os
+import urllib.request
+import multiprocessing
+import cv2
+import numpy as np
+import argparse
+from math import log, tan, radians, cos, pi, floor
+
+def make_dir(filepath):
+    dirs = os.path.dirname(os.path.abspath(filepath)).split('/')
+    p = "/"+dirs[0]
+    for d in dirs[1:]:
+        p = os.path.join(p, d)
+        if not os.path.isdir(p): os.mkdir(p)
+
+PATH = f"{os.environ.get('HOME')}/tile_cache/"
+if not os.path.isdir(PATH): make_dir(PATH)
+
+def sec(x):
+    return(1/cos(x))
+
+def latlon_to_xyz(lat, lon, z):
+    tile_count = pow(2, z)
+    x = (lon + 180) / 360
+    y = (1 - log(tan(radians(lat)) + sec(radians(lat))) / pi) / 2
+    return(tile_count*x, tile_count*y)
+
+def bbox_to_xyz(lon_min, lon_max, lat_min, lat_max, z):
+    x_min, y_max = latlon_to_xyz(lat_min, lon_min, z)
+    x_max, y_min = latlon_to_xyz(lat_max, lon_max, z)
+    return(floor(x_min), floor(x_max), floor(y_min), floor(y_max))
+
+def get_tile_ranges(
+    zoomlevel,
+    full=False,
+    lat_min = 59.139009,
+    lon_min = 18.399868,
+    lat_max = 59.098127,
+    lon_max = 18.494368,
+):
+    z = zoomlevel
+    print("zoomlevel=",z,"tile_upper=",2**z-1)
+    if full or z <= 4:
+        x_start=0
+        x_end=2**z-1
+        y_start=0
+        y_end=2**z-1
+    else:
+        bbox = bbox_to_xyz(lon_min, lon_max, -1*lat_min, -1*lat_max, z)
+        print(bbox)
+        (x_start, x_end, y_start, y_end) = bbox
+    xrange = [i for i in range(x_start, x_end+1) if not (i > 2**z-1)]
+    yrange = [i for i in range(y_start, y_end+1) if not (i > 2**z-1)][::-1]
+    return xrange, yrange
+
+def download_to_file(request, filename):
+    resp = urllib.request.urlopen(request)
+    if resp.status != 200:
+        raise RuntimeError(
+            "Request Failed :: url {request}: {resp.status} {resp.reason}"
+        )
+    nbytes = 0
+    with open(filename, "w+b") as f:
+        buffer = bytearray(1024 * 1024)
+        while buffer is not None:
+            b = resp.readinto(buffer)
+            nbytes += b
+            if b > 0:
+                f.write(buffer[:b])
+            else:
+                buffer = None
+    return nbytes
+
+def get_tile(args):
+    i, ((x, y, z), PATH) = args
+    request = f"https://map01.eniro.no/geowebcache/service/tms1.0.0/nautical/{z}/{x}/{y}.png"
+    filename = os.path.join(PATH,f"{z}",f"{x}",f"{y}.png")
+    make_dir(filename)
+    print(f"Downloading: {i}. {filename}")
+    nbytes = download_to_file(request, filename)
+    print(f"{i}. {filename} Completed {nbytes} bytes.")
+
+def prefetch(
+    zoomlevel,
+    full=False,
+    lat_min = 59.139009,
+    lon_min = 18.399868,
+    lat_max = 59.098127,
+    lon_max = 18.494368,
+):
+    z = zoomlevel
+    xrange, yrange = get_tile_ranges(
+        zoomlevel,
+        lat_min = lat_min, lon_min = lon_min,
+        lat_max = lat_max, lon_max = lon_max
+    )
+
+    to_get = []
+    for x in xrange:
+        for y in yrange:
+            fname = os.path.join(PATH,f"{z}",f"{x}",f"{y}.png")
+            if not os.path.isfile(fname):
+                to_get.append(((x,y,z),PATH))
+                make_dir(fname)
+
+    print("ladda ner dom")
+    pool = multiprocessing.Pool(processes = min([len(to_get), multiprocessing.cpu_count()]), maxtasksperchild=1000)
+    results = pool.imap_unordered(get_tile, enumerate(to_get))
+    for x in results: pass
+    pool.terminate()
+    pool.join()
+
+def untile_image(
+    zoomlevel,
+    full=False,
+    lat_min = 59.139009,
+    lon_min = 18.399868,
+    lat_max = 59.098127,
+    lon_max = 18.494368,
+):
+    
+    print(f"INFO :: Untiling image - zoomlevel {zoomlevel}")
+    im = None
+    col_count =0
+    row_count =0
+
+    xrange, yrange = get_tile_ranges(
+        zoomlevel,
+        lat_min = lat_min, lon_min = lon_min,
+        lat_max = lat_max, lon_max = lon_max
+    )
+
+    z = zoomlevel
+    for x in xrange:
+        im_col = None
+        col_count+=1
+        row_count =0
+        for y in yrange:
+            row_count+=1
+            print(f"INFO :: col={col_count}, row={row_count}")
+            image_file_name = f"{PATH}/{z}/{x}/{y}.png"
+            print(f"INFO :: untiling image :: Processing tile x={x} y={y} ({image_file_name})")
+            if not os.path.isfile(image_file_name):
+                get_tile((0, ((x, y, z), PATH)))
+            im_tile = cv2.imread(image_file_name, cv2.IMREAD_UNCHANGED)
+            assert im_tile.shape == (256,256,3)
+            if im_col is None:
+                im_col = im_tile
+            else:
+                im_col = np.concatenate((im_col, im_tile), axis=0)
+            print("im_col.shape", im_col.shape)
+        if im is None:
+            im = im_col
+        else:
+            im = np.concatenate((im, im_col), axis=1)
+        print("im.shape", im.shape)
+
+    return im
+
+def main():
+    parser = argparse.ArgumentParser(description='.')
+    parser.add_argument('command', metavar='command', type=str, help='command to run "prefetch" or "stitch"')
+    parser.add_argument('zoomlevel', metavar='zoomlevel', type=int, help='zoomlevel')
+    parser.add_argument('lat_min', metavar='lat_min', type=float, help="lattitude north west corner")
+    parser.add_argument('lon_min', metavar='lon_min', type=float, help="longitude north west corner")
+    parser.add_argument('lat_max', metavar='lat_max', type=float, help="lattitude south east corner")
+    parser.add_argument('lon_max', metavar='lon_max', type=float, help="longitude south east corner")
+    args = parser.parse_args()
+
+    if args.command == "stitch":
+        img = untile_image(
+            args.zoomlevel,
+            lat_min=args.lat_min,
+            lon_min=args.lon_min,
+            lat_max=args.lat_max,
+            lon_max=args.lon_max,
+        )
+        cv2.imwrite(f'{args.zoomlevel}.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 100])
+
+    elif args.command == "prefetch":
+        prefetch(
+            args.zoomlevel,
+            lat_min=args.lat_min,
+            lon_min=args.lon_min,
+            lat_max=args.lat_max,
+            lon_max=args.lon_max,
+        )
+
+    else:
+        print("unsupported command")
+
+if __name__ == '__main__':
+    main()
